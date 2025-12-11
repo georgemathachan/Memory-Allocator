@@ -64,8 +64,14 @@ typedef enum {
     SEG_HEALTH_FATAL = 2
 } seg_health_t;
 
-static inline size_t ceil_to_align(size_t v, size_t a) { size_t r = v % a; return r ? v + (a - r) : v; }
-static inline size_t floor_to_align(size_t v, size_t a) { return v - (v % a); }
+static inline size_t ceil_to_align(size_t v, size_t a) {
+    size_t r = v % a;
+    return r ? v + (a - r) : v;
+}
+
+static inline size_t floor_to_align(size_t v, size_t a) {
+    return v - (v % a);
+}
 
 static inline bool within_arena(size_t off, size_t len) {
     return off <= arena_bytes && len <= arena_bytes && off + len <= arena_bytes;
@@ -227,8 +233,7 @@ static size_t isolate_span(size_t off, uint32_t hint) {
 static bool rebuild_header_via_footer(size_t off) {
     size_t start = off + SEG_HEAD_BYTES + MIN_USER_BYTES;
     if (start + SEG_TAIL_BYTES > arena_bytes) return false;
-    for (size_t f = start;
-         f + SEG_TAIL_BYTES <= arena_bytes;
+    for (size_t f = start; f + SEG_TAIL_BYTES <= arena_bytes;
          f += MM_ALIGNMENT) {
         SegmentTail *t = (SegmentTail *)(arena_mem + f);
         uint32_t sp = t->span;
@@ -236,13 +241,12 @@ static bool rebuild_header_via_footer(size_t off) {
         if (t->span_neg != ~sp) continue;
         if (checksum_tail(sp, ~sp) != t->crc) continue;
         if (sp % MM_ALIGNMENT != 0) continue;
-        if (sp < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES) continue;
+        if (sp < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES)
+            continue;
         if (!within_arena(off, sp)) continue;
         if (f != off + sp - SEG_TAIL_BYTES) continue;
         emit_head(off, sp, SEG_FLAG_INUSE);
-        update_head_extras(off,
-                           hash_payload_bytes(off, sp),
-                           0);
+        update_head_extras(off, hash_payload_bytes(off, sp), 0);
         return true;
     }
     return false;
@@ -263,9 +267,9 @@ static seg_health_t verify_segment(size_t off, SegmentHead **out) {
     SegmentHead *h = head_at(off);
     if (!h) return SEG_HEALTH_FATAL;
     uint32_t sp = h->span;
+
 again:
-    if (h->tag != SEG_MAGIC_HEADER ||
-        h->span_neg != ~sp ||
+    if (h->tag != SEG_MAGIC_HEADER || h->span_neg != ~sp ||
         sp % MM_ALIGNMENT != 0 ||
         sp < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES ||
         !within_arena(off, sp)) {
@@ -292,8 +296,7 @@ again:
     } else if (seg_is_free(h)) {
         if (exp != act) {
             paint_free_payload(off, sp);
-            update_head_extras(off,
-                               hash_payload_bytes(off, sp),
+            update_head_extras(off, hash_payload_bytes(off, sp),
                                h->meta_b);
         }
     }
@@ -357,8 +360,7 @@ static seg_health_t locate_segment_from_userptr(void *ptr,
     uintptr_t p = (uintptr_t)ptr;
     uintptr_t b = (uintptr_t)arena_origin;
     if (((p - b) % MM_ALIGNMENT) != 0) return SEG_HEALTH_FATAL;
-    if (p < b + SEG_HEAD_BYTES ||
-        p >= b + arena_bytes - SEG_TAIL_BYTES)
+    if (p < b + SEG_HEAD_BYTES || p >= b + arena_bytes - SEG_TAIL_BYTES)
         return SEG_HEALTH_FATAL;
     size_t off = (p - b) - SEG_HEAD_BYTES;
     SegmentHead *h = NULL;
@@ -376,8 +378,7 @@ static seg_health_t locate_segment_from_userptr(void *ptr,
 }
 
 int mm_init(uint8_t *mem, size_t len) {
-    if (!mem ||
-        len < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES)
+    if (!mem || len < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES)
         return -1;
     storm_trace = getenv("MM_BROWNOUT_DEBUG") != NULL;
     detect_poison_pattern(mem, len);
@@ -403,13 +404,12 @@ void *mm_malloc(size_t size) {
     bool repair = false;
 
 retry:
-    ;
     size_t plen = ceil_to_align(size, MM_ALIGNMENT);
     size_t need = ceil_to_align(plen + SEG_HEAD_BYTES + SEG_TAIL_BYTES,
                                 MM_ALIGNMENT);
     if (need > arena_bytes) goto out;
 
-    for (size_t off = 0; off + SEG_HEAD_BYTES <= arena_bytes; ) {
+    for (size_t off = 0; off + SEG_HEAD_BYTES <= arena_bytes;) {
         if (off % MM_ALIGNMENT) {
             off = ceil_to_align(off, MM_ALIGNMENT);
             continue;
@@ -497,6 +497,7 @@ int mm_read(void *ptr, size_t off, void *buf, size_t len) {
     }
     memcpy(buf, (uint8_t *)ptr + off, len);
     r = (int)len;
+
 out:
     ARENA_UNLOCK();
     return r;
@@ -515,10 +516,9 @@ int mm_write(void *ptr, size_t off, const void *src, size_t len) {
         goto out;
     }
     memcpy((uint8_t *)ptr + off, src, len);
-    update_head_extras(so,
-                       hash_payload_bytes(so, h->span),
-                       h->meta_b);
+    update_head_extras(so, hash_payload_bytes(so, h->span), h->meta_b);
     r = (int)len;
+
 out:
     ARENA_UNLOCK();
     return r;
@@ -529,8 +529,14 @@ void mm_free(void *ptr) {
     SegmentHead *h = NULL;
     size_t so = 0;
     seg_health_t st = locate_segment_from_userptr(ptr, &h, &so);
-    if (st != SEG_HEALTH_OK) { ARENA_UNLOCK(); return; }
-    if (!h || !h->flags || seg_is_isolated(h)) { ARENA_UNLOCK(); return; }
+    if (st != SEG_HEALTH_OK) {
+        ARENA_UNLOCK();
+        return;
+    }
+    if (!h || !h->flags || seg_is_isolated(h)) {
+        ARENA_UNLOCK();
+        return;
+    }
     init_segment(so, h->span, 0, 0);
     h = head_at(so);
     if (h) merge_adjacent_free_segments(so, h);

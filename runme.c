@@ -27,8 +27,9 @@ int main(void) {
     }
 
     uint8_t data[32];
-    for (int i = 0; i < 32; i++)
+    for (int i = 0; i < 32; i++) {
         data[i] = (uint8_t)(i + 1);
+    }
 
     int w = mm_write(p, 0, data, 32);
     if (w < 0) {
@@ -43,8 +44,8 @@ int main(void) {
         printf("mm_read failed\n");
     } else {
         printf("mm_read OK (%d bytes)\n", r);
-        printf("first few bytes: %u %u %u %u\n",
-               out[0], out[1], out[2], out[3]);
+        printf("first few bytes: %u %u %u %u\n", out[0], out[1], out[2],
+               out[3]);
     }
 
     mm_free(p);
