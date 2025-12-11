@@ -1,876 +1,538 @@
-// George Mathachan
-
 #include "allocator.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <pthread.h>
-#include <stdint.h>
-#include <stddef.h>
 
-#define BLOCK_MAGIC        0x12345678u
-#define FOOTER_MAGIC       0x87654321u
-#define HEADER_SIZE        40u
-#define FOOTER_SIZE        16u
-#define MIN_PAYLOAD        16u
-#define FLAG_ALLOCATED     0x1u
-#define FLAG_QUARANTINED   0x2u
-
-#define PAYLOAD_HASH_INIT   0xAAAAAAAAu
-#define PAYLOAD_HASH_PRIME  0xBBBBBBBBu
-#define HEADER_HASH_SEED    0xCCCCCCCCu
-#define HEADER_HASH_PRIME   0xDDDDDDDDu
-#define FOOTER_HASH_SEED    0xEEEEEEEEu
+#define SEG_MAGIC_HEADER   0x8F51C2A3u
+#define SEG_MAGIC_FOOTER   0x3AC2F158u
+#define SEG_HEAD_BYTES     40u
+#define SEG_TAIL_BYTES     16u
+#define MIN_USER_BYTES     8u
+#define SEG_FLAG_INUSE     0x10u
+#define SEG_FLAG_ISOLATED  0x40u
+#define PAY_HASH_INIT      1469598103934665603ull
+#define PAY_HASH_FACTOR    1099511628211ull
+#define HDR_HASH_SEED      0x5F1Du
+#define HDR_HASH_FACTOR    31337u
+#define FTR_HASH_SEED      0xBADC0FFEu
 
 #ifndef UNUSED_PATTERN_BYTES
-#define UNUSED_PATTERN_BYTES {0xA5u, 0x5Au, 0x3Cu, 0xC3u, 0x7Eu}
+#define UNUSED_PATTERN_BYTES {0xDEu, 0xADu, 0xFAu, 0xCEu, 0x42u}
 #endif
 
-typedef struct __attribute__((packed)) BlockHeader {
-    uint32_t magic;
-    uint32_t size;
-    uint32_t inv_size;
-    uint8_t  flags;
-    uint8_t  _pad1;
-    uint8_t  _pad2;
-    uint8_t  _pad3;
-    uint64_t integrity_check_value;
-    uint32_t size_xor_magic;
-    uint32_t client_size_request;
-    uint32_t canary;
-    uint32_t checksum;
-} BlockHeader;
+typedef struct __attribute__((packed)) SegmentHead {
+    uint32_t tag;
+    uint32_t span;
+    uint32_t span_neg;
+    uint32_t flags;
+    uint64_t meta_a;
+    uint64_t meta_b;
+    uint32_t guard;
+    uint32_t crc;
+} SegmentHead;
 
-_Static_assert(sizeof(BlockHeader) == HEADER_SIZE,
-               "Header must be exactly 40 bytes");
+_Static_assert(sizeof(SegmentHead) == SEG_HEAD_BYTES, "");
 
-typedef struct __attribute__((packed)) BlockFooter {
-    uint32_t magic;
-    uint32_t size;
-    uint32_t inv_size;
-    uint32_t checksum;
-} BlockFooter;
+typedef struct __attribute__((packed)) SegmentTail {
+    uint32_t tag;
+    uint32_t span;
+    uint32_t span_neg;
+    uint32_t crc;
+} SegmentTail;
 
-_Static_assert(sizeof(BlockFooter) == FOOTER_SIZE,
-               "Footer must be exactly 16 bytes");
+_Static_assert(sizeof(SegmentTail) == SEG_TAIL_BYTES, "");
 
-static uint8_t *g_heap = NULL;
-static uint8_t *g_heap_base = NULL;
-static size_t g_heap_size = 0;
-static bool g_ready = false;
+static uint8_t *arena_mem    = NULL;
+static uint8_t *arena_origin = NULL;
+static size_t   arena_bytes  = 0;
+static bool     arena_online = false;
 
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+#define ARENA_LOCK()
+#define ARENA_UNLOCK()
 
-#define LOCK()   pthread_mutex_lock(&g_lock)
-#define UNLOCK() pthread_mutex_unlock(&g_lock)
+static uint8_t poison_pattern[5] = UNUSED_PATTERN_BYTES;
+static size_t  poison_phase = 0;
 
-static uint8_t g_unused_pattern[5] = UNUSED_PATTERN_BYTES;
-static size_t g_pattern_phase = 0;
-static bool g_dbg_brown = false;
+static bool storm_trace = false;
+#define STORM_LOG(...) do { if (storm_trace) fprintf(stderr, __VA_ARGS__); } while (0)
 
-#define DBG_BROWN(...) \
-    do { \
-        if (g_dbg_brown) { \
-            fprintf(stderr, __VA_ARGS__); \
-        } \
-    } while (0)
+typedef enum {
+    SEG_HEALTH_OK = 0,
+    SEG_HEALTH_CORRUPT = 1,
+    SEG_HEALTH_FATAL = 2
+} seg_health_t;
 
-static inline size_t align_up(size_t v, size_t align) {
-    if (align == 0) return v;
-    size_t rem = v % align;
-    return rem ? v + (align - rem) : v;
+static inline size_t ceil_to_align(size_t v, size_t a) { size_t r = v % a; return r ? v + (a - r) : v; }
+static inline size_t floor_to_align(size_t v, size_t a) { return v - (v % a); }
+
+static inline bool within_arena(size_t off, size_t len) {
+    return off <= arena_bytes && len <= arena_bytes && off + len <= arena_bytes;
 }
 
-static inline size_t align_down(size_t v, size_t align) {
-    if (align == 0) return v;
-    return v - (v % align);
+static SegmentHead *head_at(size_t off) {
+    if (!within_arena(off, SEG_HEAD_BYTES)) return NULL;
+    return (SegmentHead *)(arena_mem + off);
 }
 
-static inline bool in_heap(size_t off, size_t len) {
-    return off <= g_heap_size && len <= g_heap_size &&
-           off + len <= g_heap_size;
+static SegmentTail *tail_at(size_t off, uint32_t span) {
+    size_t to = off + span - SEG_TAIL_BYTES;
+    if (!within_arena(to, SEG_TAIL_BYTES)) return NULL;
+    return (SegmentTail *)(arena_mem + to);
 }
 
-static void detect_unused_pattern(const uint8_t *heap, size_t heap_size) {
-    if (!heap || heap_size < 5) return;
+static inline bool seg_is_free(const SegmentHead *h) {
+    return !(h->flags & SEG_FLAG_INUSE) && !(h->flags & SEG_FLAG_ISOLATED);
+}
 
-    uint8_t candidate[5];
-    for (size_t i = 0; i < 5; ++i) candidate[i] = heap[i];
+static inline bool seg_is_isolated(const SegmentHead *h) {
+    return (h->flags & SEG_FLAG_ISOLATED) != 0;
+}
 
-    size_t sample = heap_size < 25 ? heap_size : 25;
-    for (size_t i = 0; i < sample; ++i) {
-        if (heap[i] != candidate[i % 5]) return;
+static inline size_t next_segment_offset(size_t off, uint32_t span) {
+    size_t n = off + span;
+    return (n >= arena_bytes) ? arena_bytes : n;
+}
+
+static void detect_poison_pattern(const uint8_t *buf, size_t len) {
+    if (!buf || len < 5) return;
+    uint8_t cand[5];
+    for (size_t i = 0; i < 5; ++i) cand[i] = buf[i];
+    size_t s = len < 25 ? len : 25;
+    for (size_t i = 0; i < s; ++i) if (buf[i] != cand[i % 5]) return;
+    for (size_t i = 0; i < 5; ++i) poison_pattern[i] = cand[i];
+}
+
+static uint32_t derive_guard(size_t off, uint32_t span) {
+    uint32_t v = (uint32_t)(off * 1315423911u) ^ (span * 2654435761u);
+    v ^= SEG_MAGIC_HEADER;
+    v ^= (v << 5);
+    v ^= (v >> 13);
+    v ^= (v << 17);
+    return v;
+}
+
+static uint32_t checksum_head(const SegmentHead *h) {
+    const uint8_t *b = (const uint8_t *)h;
+    uint32_t hash = HDR_HASH_SEED;
+    for (size_t i = 0; i < SEG_HEAD_BYTES - sizeof(uint32_t); ++i) {
+        hash ^= b[i];
+        hash *= HDR_HASH_FACTOR;
+        hash ^= (hash >> 7);
     }
-
-    for (size_t i = 0; i < 5; ++i) g_unused_pattern[i] = candidate[i];
+    hash ^= SEG_MAGIC_FOOTER;
+    return hash;
 }
 
-static bool payload_bounds(size_t off, uint32_t size,
-                           size_t *payload_off, size_t *payload_size) {
-    if (size < HEADER_SIZE + FOOTER_SIZE) return false;
-    size_t poff = off + HEADER_SIZE;
-    size_t psz = (size_t)size - HEADER_SIZE - FOOTER_SIZE;
-    if (!in_heap(poff, psz)) return false;
-    if (payload_off) *payload_off = poff;
-    if (payload_size) *payload_size = psz;
+static uint32_t checksum_tail(uint32_t s, uint32_t sn) {
+    uint32_t h = FTR_HASH_SEED;
+    h ^= s;  h += (h << 3) ^ 0xA1B2C3D4u;
+    h ^= sn; h += (h >> 5) ^ 0x1F2E3D4Cu;
+    h ^= SEG_MAGIC_FOOTER;
+    return h;
+}
+
+static bool payload_region(size_t off, uint32_t span,
+                           size_t *poff, size_t *plen) {
+    if (span < SEG_HEAD_BYTES + SEG_TAIL_BYTES) return false;
+    size_t p = off + SEG_HEAD_BYTES;
+    size_t l = span - SEG_HEAD_BYTES - SEG_TAIL_BYTES;
+    if (!within_arena(p, l)) return false;
+    if (poff) *poff = p;
+    if (plen) *plen = l;
     return true;
 }
 
-static uint64_t calculate_data_fingerprint(size_t off, uint32_t size) {
-    size_t poff = 0, psz = 0;
-    if (!payload_bounds(off, size, &poff, &psz)) return 0;
-
-    const uint8_t *p = g_heap + poff;
-    uint64_t h = PAYLOAD_HASH_INIT;
-    for (size_t i = 0; i < psz; ++i) {
-        h ^= p[i];
-        h *= PAYLOAD_HASH_PRIME;
+static uint64_t hash_payload_bytes(size_t off, uint32_t span) {
+    size_t p = 0, l = 0;
+    if (!payload_region(off, span, &p, &l)) return 0;
+    const uint8_t *x = arena_mem + p;
+    uint64_t h = PAY_HASH_INIT;
+    for (size_t i = 0; i < l; ++i) {
+        h ^= x[i];
+        h *= PAY_HASH_FACTOR;
     }
     return h;
 }
 
-typedef enum { BLOCK_OK = 0, BLOCK_CORRUPT = 1, BLOCK_FATAL = 2 } block_check_t;
-static bool block_is_free(const BlockHeader *h);
-static bool block_is_quarantined(const BlockHeader *h);
-
-static uint32_t compute_integrity_key(size_t offset, uint32_t size) {
-    uint32_t v = (uint32_t)offset ^ (size >> 3) ^ BLOCK_MAGIC;
-    v ^= (v >> 13);
-    v ^= (v << 5);
-    return v;
-}
-
-static uint32_t verify_metadata_hash(const BlockHeader *h) {
-    const uint8_t *bytes = (const uint8_t *)h;
-    uint32_t hash = HEADER_HASH_SEED;
-    for (size_t i = 0; i < HEADER_SIZE - sizeof(uint32_t); ++i) {
-        hash ^= bytes[i];
-        hash *= HEADER_HASH_PRIME;
-    }
-    hash ^= 0x9E3779B1u;
-    return hash;
-}
-
-static uint32_t checksum_footer(uint32_t size, uint32_t inv_size) {
-    uint32_t hash = FOOTER_HASH_SEED;
-    hash ^= size + 0x517CC1B5u + (hash << 7) + (hash >> 3);
-    hash ^= inv_size + 0xA2F7CA6Du + (hash << 7) + (hash >> 3);
-    hash ^= 0x5DEECE66Du;
-    return hash;
-}
-
-static BlockHeader *get_block_header(size_t off) {
-    if (!in_heap(off, HEADER_SIZE)) return NULL;
-    return (BlockHeader *)(g_heap + off);
-}
-
-static BlockFooter *ftr_at(size_t off, uint32_t size) {
-    if (size < HEADER_SIZE + FOOTER_SIZE) return NULL;
-    size_t foff = off + size - FOOTER_SIZE;
-    if (!in_heap(foff, FOOTER_SIZE)) return NULL;
-    return (BlockFooter *)(g_heap + foff);
-}
-
-static void write_header(size_t off, uint32_t size, uint32_t status) {
-    BlockHeader *h = get_block_header(off);
+static void emit_head(size_t off, uint32_t span, uint32_t flags) {
+    SegmentHead *h = head_at(off);
     if (!h) return;
-    h->magic = BLOCK_MAGIC;
-    h->size = size;
-    h->inv_size = ~size;
-    h->flags = (uint8_t)status;
-    h->_pad1 = 0;
-    h->_pad2 = 0;
-    h->_pad3 = 0;
-    h->size_xor_magic = size ^ BLOCK_MAGIC;
-    h->canary = compute_integrity_key(off, size);
-    h->checksum = verify_metadata_hash(h);
+    h->tag = SEG_MAGIC_HEADER;
+    h->span = span;
+    h->span_neg = ~span;
+    h->flags = flags;
+    h->meta_a = 0;
+    h->meta_b = 0;
+    h->guard = derive_guard(off, span);
+    h->crc = checksum_head(h);
 }
 
-static void write_footer(size_t off, uint32_t size) {
-    BlockFooter *f = ftr_at(off, size);
-    if (!f) return;
-    f->magic = FOOTER_MAGIC;
-    f->size = size;
-    f->inv_size = ~size;
-    f->checksum = checksum_footer(size, ~size);
+static void emit_tail(size_t off, uint32_t span) {
+    SegmentTail *t = tail_at(off, span);
+    if (!t) return;
+    t->tag = SEG_MAGIC_FOOTER;
+    t->span = span;
+    t->span_neg = ~span;
+    t->crc = checksum_tail(span, ~span);
 }
 
-static void set_header_extras(size_t off, uint64_t hash, uint64_t aux) {
-    BlockHeader *h = get_block_header(off);
+static void update_head_extras(size_t off, uint64_t ha, uint64_t b) {
+    SegmentHead *h = head_at(off);
     if (!h) return;
-    h->integrity_check_value = hash;
-    h->client_size_request = aux;
-    h->checksum = verify_metadata_hash(h);
+    h->meta_a = ha;
+    h->meta_b = b;
+    h->crc = checksum_head(h);
 }
 
-static void paint_free_payload(size_t off, uint32_t size) {
-    size_t payload_off = off + HEADER_SIZE;
-    size_t payload_size = 0;
-    if (size >= HEADER_SIZE + FOOTER_SIZE)
-        payload_size = size - HEADER_SIZE - FOOTER_SIZE;
-    if (!in_heap(payload_off, payload_size)) return;
-
-    size_t phase = (payload_off + g_pattern_phase) % 5;
-    for (size_t i = 0; i < payload_size; ++i)
-        g_heap[payload_off + i] = g_unused_pattern[(phase + i) % 5];
+static void paint_free_payload(size_t off, uint32_t span) {
+    size_t p = off + SEG_HEAD_BYTES;
+    size_t l = span - SEG_HEAD_BYTES - SEG_TAIL_BYTES;
+    if (!within_arena(p, l)) return;
+    size_t ph = (p + poison_phase) % 5;
+    for (size_t i = 0; i < l; ++i)
+        arena_mem[p + i] = poison_pattern[(ph + i) % 5];
 }
 
-static void build_block(size_t off,
-    uint32_t size,
-    uint32_t status,
-    uint64_t requested_size) {
-    write_header(off, size, status);
-    write_footer(off, size);
-
-    if (status & FLAG_ALLOCATED) {
-        set_header_extras(off, calculate_data_fingerprint(off, size),
-                          requested_size);
+static void init_segment(size_t off, uint32_t span,
+                         uint32_t flags, uint64_t req) {
+    emit_head(off, span, flags);
+    emit_tail(off, span);
+    if (flags & SEG_FLAG_INUSE) {
+        update_head_extras(off,
+                           hash_payload_bytes(off, span),
+                           req);
     } else {
-        paint_free_payload(off, size);
-        set_header_extras(off, calculate_data_fingerprint(off, size), 0);
+        paint_free_payload(off, span);
+        update_head_extras(off,
+                           hash_payload_bytes(off, span),
+                           0);
     }
 }
 
-static size_t quarantine_span(size_t off, uint32_t hint_size) {
-    size_t max_size = align_down(g_heap_size - off, MM_ALIGNMENT);
-    if (max_size < HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD) return 0;
-
-    size_t span = align_up(hint_size ? hint_size : MM_ALIGNMENT,
-                           MM_ALIGNMENT);
-    if (span < HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD)
-        span = HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD;
-    if (span > max_size) span = max_size;
-    if (span > UINT32_MAX) span = UINT32_MAX;
-
-    build_block(off, (uint32_t)span, FLAG_QUARANTINED, 0);
-    return span;
+static size_t isolate_span(size_t off, uint32_t hint) {
+    size_t max = floor_to_align(arena_bytes - off, MM_ALIGNMENT);
+    if (max < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES) return 0;
+    size_t s = hint ? hint : MM_ALIGNMENT;
+    s = ceil_to_align(s, MM_ALIGNMENT);
+    if (s < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES)
+        s = SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES;
+    if (s > max) s = max;
+    if (s > UINT32_MAX) s = UINT32_MAX;
+    init_segment(off, (uint32_t)s, SEG_FLAG_ISOLATED, 0);
+    return s;
 }
 
-static bool recover_header_from_footer(size_t off) {
-    // Scan for a plausible footer on MM_ALIGNMENT boundaries.
-    size_t start = off + HEADER_SIZE + MIN_PAYLOAD;
-    if (start + FOOTER_SIZE > g_heap_size) return false;
-
-    DBG_BROWN("[brown] recover start off=%zu start=%zu\n", off, start);
-
-    for (size_t foff = start; foff + FOOTER_SIZE <= g_heap_size;
-         foff += MM_ALIGNMENT) {
-        BlockFooter *f = (BlockFooter *)(g_heap + foff);
-
-        uint32_t size = f->size;
-        if (f->magic != FOOTER_MAGIC) continue;
-        if (f->inv_size != ~size) continue;
-        if (checksum_footer(size, ~size) != f->checksum) continue;
-        if (size % MM_ALIGNMENT != 0) continue;
-        if (size < HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD) continue;
-        if (!in_heap(off, size)) continue;
-        if (foff != off + size - FOOTER_SIZE) continue;
-
-        DBG_BROWN("[brown] recover hit footer off=%zu size=%u\n",
-                  foff,
-                  size);
-        write_header(off, size, FLAG_ALLOCATED);
-        set_header_extras(off, calculate_data_fingerprint(off, size), 0);
+static bool rebuild_header_via_footer(size_t off) {
+    size_t start = off + SEG_HEAD_BYTES + MIN_USER_BYTES;
+    if (start + SEG_TAIL_BYTES > arena_bytes) return false;
+    for (size_t f = start;
+         f + SEG_TAIL_BYTES <= arena_bytes;
+         f += MM_ALIGNMENT) {
+        SegmentTail *t = (SegmentTail *)(arena_mem + f);
+        uint32_t sp = t->span;
+        if (t->tag != SEG_MAGIC_FOOTER) continue;
+        if (t->span_neg != ~sp) continue;
+        if (checksum_tail(sp, ~sp) != t->crc) continue;
+        if (sp % MM_ALIGNMENT != 0) continue;
+        if (sp < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES) continue;
+        if (!within_arena(off, sp)) continue;
+        if (f != off + sp - SEG_TAIL_BYTES) continue;
+        emit_head(off, sp, SEG_FLAG_INUSE);
+        update_head_extras(off,
+                           hash_payload_bytes(off, sp),
+                           0);
         return true;
     }
-
-    DBG_BROWN("[brown] recover failed off=%zu\n", off);
     return false;
 }
 
-static block_check_t validate_block(size_t off, BlockHeader **out_h) {
-    BlockHeader *h = get_block_header(off);
-    if (!h) return BLOCK_FATAL;
-    uint32_t size = h->size;
+static void isolate_segment(size_t off, uint32_t span) {
+    SegmentHead *h = head_at(off);
+    if (!h || !within_arena(off, span)) return;
+    uint32_t fl = (h->flags | SEG_FLAG_ISOLATED) & ~SEG_FLAG_INUSE;
+    emit_head(off, span, fl);
+    emit_tail(off, span);
+    update_head_extras(off,
+                       hash_payload_bytes(off, span),
+                       0);
+}
 
-restart:
-    if (h->magic != BLOCK_MAGIC || h->inv_size != ~size ||
-        size % MM_ALIGNMENT != 0 ||
-        size < HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD ||
-        !in_heap(off, size) ||
-        h->size_xor_magic != (size ^ BLOCK_MAGIC)) {
-        DBG_BROWN("[brown] invalid header off=%zu magic=0x%x size=%u\n",
-                  off,
-                  h ? h->magic : 0,
-                  h ? h->size : 0);
-        if (recover_header_from_footer(off)) {
-            h = get_block_header(off);
-            if (!h) return BLOCK_FATAL;
-            size = h->size;
-            goto restart;
+static seg_health_t verify_segment(size_t off, SegmentHead **out) {
+    SegmentHead *h = head_at(off);
+    if (!h) return SEG_HEALTH_FATAL;
+    uint32_t sp = h->span;
+again:
+    if (h->tag != SEG_MAGIC_HEADER ||
+        h->span_neg != ~sp ||
+        sp % MM_ALIGNMENT != 0 ||
+        sp < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES ||
+        !within_arena(off, sp)) {
+        if (rebuild_header_via_footer(off)) {
+            h = head_at(off);
+            sp = h ? h->span : 0;
+            if (!h) return SEG_HEALTH_FATAL;
+            goto again;
         }
-
-        if (h->magic != BLOCK_MAGIC)
-            return BLOCK_FATAL;
-        return BLOCK_CORRUPT;
+        if (h->tag != SEG_MAGIC_HEADER) return SEG_HEALTH_FATAL;
+        return SEG_HEALTH_CORRUPT;
     }
-
-    if (h->canary != compute_integrity_key(off, size)) {
-        DBG_BROWN("[brown] canary mismatch off=%zu size=%u\n", off, size);
-        return BLOCK_CORRUPT;
-    }
-    if (h->checksum != verify_metadata_hash(h)) {
-        DBG_BROWN("[brown] header checksum bad off=%zu size=%u\n",
-                  off,
-                  size);
-        return BLOCK_CORRUPT;
-    }
-
-    BlockFooter *f = ftr_at(off, size);
-    if (!f) return BLOCK_CORRUPT;
-    if (f->magic != FOOTER_MAGIC) {
-        DBG_BROWN("[brown] footer magic bad off=%zu size=%u\n", off, size);
-        return BLOCK_CORRUPT;
-    }
-    if (f->size != size || f->inv_size != ~size) {
-        DBG_BROWN("[brown] footer size bad off=%zu size=%u\n", off, size);
-        return BLOCK_CORRUPT;
-    }
-    if (f->checksum != checksum_footer(size, ~size)) {
-        DBG_BROWN("[brown] footer checksum bad off=%zu size=%u\n",
-                  off,
-                  size);
-        return BLOCK_CORRUPT;
-    }
-
-    uint64_t expected = h->integrity_check_value;
-    uint64_t actual = calculate_data_fingerprint(off, size);
-    if (block_is_quarantined(h)) {
-        if (expected != actual) {
-            DBG_BROWN("[brown] quarant hash mismatch off=%zu size=%u\n",
-                      off,
-                      size);
-            return BLOCK_CORRUPT;
-        }
-    } else if (block_is_free(h)) {
-        if (expected != actual) {
-            DBG_BROWN("[brown] free hash repaint off=%zu size=%u\n",
-                      off,
-                      size);
-            paint_free_payload(off, size);
-            set_header_extras(off, calculate_data_fingerprint(off, size),
-                              h->client_size_request);
+    if (h->guard != derive_guard(off, sp)) return SEG_HEALTH_CORRUPT;
+    if (h->crc != checksum_head(h)) return SEG_HEALTH_CORRUPT;
+    SegmentTail *t = tail_at(off, sp);
+    if (!t) return SEG_HEALTH_CORRUPT;
+    if (t->tag != SEG_MAGIC_FOOTER) return SEG_HEALTH_CORRUPT;
+    if (t->span != sp || t->span_neg != ~sp) return SEG_HEALTH_CORRUPT;
+    if (t->crc != checksum_tail(sp, ~sp)) return SEG_HEALTH_CORRUPT;
+    uint64_t exp = h->meta_a;
+    uint64_t act = hash_payload_bytes(off, sp);
+    if (seg_is_isolated(h)) {
+        if (exp != act) return SEG_HEALTH_CORRUPT;
+    } else if (seg_is_free(h)) {
+        if (exp != act) {
+            paint_free_payload(off, sp);
+            update_head_extras(off,
+                               hash_payload_bytes(off, sp),
+                               h->meta_b);
         }
     }
-
-    if (out_h) *out_h = h;
-    return BLOCK_OK;
+    if (out) *out = h;
+    return SEG_HEALTH_OK;
 }
 
-static void quarantine_block(size_t off, uint32_t size) {
-    BlockHeader *h = get_block_header(off);
-    if (!h || !in_heap(off, size)) return;
-    uint8_t status = (uint8_t)((h->flags | FLAG_QUARANTINED) &
-                               ~FLAG_ALLOCATED);
-    DBG_BROWN("[brown] quarantine off=%zu size=%u\n", off, size);
-    write_header(off, size, status);
-    write_footer(off, size);
-    set_header_extras(off, calculate_data_fingerprint(off, size), 0);
-}
-
-static size_t next_block_offset(size_t off, uint32_t size) {
-    size_t next = off + size;
-    return (next >= g_heap_size) ? g_heap_size : next;
-}
-
-static bool block_is_free(const BlockHeader *h) {
-    return !(h->flags & FLAG_ALLOCATED) && !(h->flags & FLAG_QUARANTINED);
-}
-
-static bool block_is_quarantined(const BlockHeader *h) {
-    return (h->flags & FLAG_QUARANTINED) != 0;
-}
-
-static void coalesce_with_neighbors(size_t off, BlockHeader *h) {
-    uint32_t size = h->size;
-    size_t next_off = next_block_offset(off, size);
-    if (next_off + HEADER_SIZE <= g_heap_size) {
-        BlockHeader *nh = get_block_header(next_off);
+static void merge_adjacent_free_segments(size_t off, SegmentHead *h) {
+    uint32_t sp = h->span;
+    size_t next = next_segment_offset(off, sp);
+    if (next + SEG_HEAD_BYTES <= arena_bytes) {
+        SegmentHead *nh = head_at(next);
         if (nh) {
-            block_check_t r = validate_block(next_off, &nh);
-            if (r == BLOCK_OK && block_is_free(nh)) {
-                size += nh->size;
-                build_block(off, size, 0, 0);
-                h = get_block_header(off);
-                size = h ? h->size : size;
-            } else if (r == BLOCK_CORRUPT) {
-                quarantine_block(next_off, nh ? nh->size : 0);
+            seg_health_t st = verify_segment(next, &nh);
+            if (st == SEG_HEALTH_OK && seg_is_free(nh)) {
+                sp += nh->span;
+                init_segment(off, sp, 0, 0);
+                h = head_at(off);
+                sp = h ? h->span : sp;
+            } else if (st == SEG_HEALTH_CORRUPT) {
+                isolate_segment(next, nh ? nh->span : 0);
             }
         }
     }
-
-    if (off >= FOOTER_SIZE) {
-        size_t foff = off - FOOTER_SIZE;
-        BlockFooter *pf = (BlockFooter *)(g_heap + foff);
-        uint32_t psize = 0;
-
-        if (in_heap(foff, FOOTER_SIZE) &&
-            pf->magic == FOOTER_MAGIC && pf->inv_size == ~pf->size)
-            psize = pf->size;
-
-        if (psize >= HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD &&
-            off >= psize) {
-            size_t prev_off = off - psize;
-            BlockHeader *ph = get_block_header(prev_off);
+    if (off >= SEG_TAIL_BYTES) {
+        size_t pt = off - SEG_TAIL_BYTES;
+        SegmentTail *t = (SegmentTail *)(arena_mem + pt);
+        uint32_t psp = 0;
+        if (within_arena(pt, SEG_TAIL_BYTES) &&
+            t->tag == SEG_MAGIC_FOOTER &&
+            t->span_neg == ~t->span)
+            psp = t->span;
+        if (psp >= SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES &&
+            off >= psp) {
+            size_t po = off - psp;
+            SegmentHead *ph = head_at(po);
             if (ph) {
-                if (ph->canary != compute_integrity_key(prev_off, psize)) {
-                    DBG_BROWN("[brown] Prev canary mismatch, "
-                              "quarantining.\n");
-                    quarantine_block(prev_off, psize);
-                    return;
-                }
-
-                block_check_t r = validate_block(prev_off, &ph);
-                if (r == BLOCK_OK && block_is_free(ph)) {
-                    size_t new_size = psize + h->size;
-                    build_block(prev_off, new_size, 0, 0);
-                    off = prev_off;
-                    h = get_block_header(off);
-                    size = h->size;
-                } else if (r == BLOCK_CORRUPT) {
-                    quarantine_block(prev_off, ph ? ph->size : 0);
+                seg_health_t st = verify_segment(po, &ph);
+                if (st == SEG_HEALTH_OK && seg_is_free(ph)) {
+                    size_t ns = psp + h->span;
+                    init_segment(po, ns, 0, 0);
+                    off = po;
+                    h = head_at(off);
+                    sp = h->span;
+                } else if (st == SEG_HEALTH_CORRUPT) {
+                    isolate_segment(po, ph ? ph->span : 0);
                 }
             }
         }
     }
 }
 
-static int ensure_ready(void) {
-    return g_ready ? 0 : -1;
+static int arena_ready(void) {
+    return arena_online ? 0 : -1;
 }
 
-int mm_init(uint8_t *heap, size_t heap_size) {
-    if (!heap || heap_size < HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD)
-        return -1;
-
-    g_dbg_brown = getenv("MM_BROWNOUT_DEBUG") != NULL;
-    if (g_dbg_brown) {
-        fprintf(stderr, "[brown] debug enabled\n");
+static seg_health_t locate_segment_from_userptr(void *ptr,
+                                                SegmentHead **out,
+                                                size_t *ooff) {
+    if (arena_ready() != 0 || !ptr) return SEG_HEALTH_FATAL;
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t b = (uintptr_t)arena_origin;
+    if (((p - b) % MM_ALIGNMENT) != 0) return SEG_HEALTH_FATAL;
+    if (p < b + SEG_HEAD_BYTES ||
+        p >= b + arena_bytes - SEG_TAIL_BYTES)
+        return SEG_HEALTH_FATAL;
+    size_t off = (p - b) - SEG_HEAD_BYTES;
+    SegmentHead *h = NULL;
+    seg_health_t st = verify_segment(off, &h);
+    if (st != SEG_HEALTH_OK) {
+        if (rebuild_header_via_footer(off))
+            st = verify_segment(off, &h);
+        if (st != SEG_HEALTH_OK) return st;
     }
+    if (!h || !(h->flags & SEG_FLAG_INUSE) || seg_is_isolated(h))
+        return SEG_HEALTH_FATAL;
+    if (out) *out = h;
+    if (ooff) *ooff = off;
+    return SEG_HEALTH_OK;
+}
 
-    detect_unused_pattern(heap, heap_size);
-    g_pattern_phase = 0;
-
-    g_heap_base = heap;
-
-// Align the working heap start to 40 bytes within the given block
-uint8_t *aligned_start = (uint8_t *)align_up((size_t)heap, MM_ALIGNMENT);
-size_t skipped = (size_t)(aligned_start - heap);
-
-if (skipped > heap_size) return -1;
-
-size_t usable = heap_size - skipped;
-usable = align_down(usable, MM_ALIGNMENT);
-
-if (usable < HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD)
-    return -1;
-
-g_heap = aligned_start;
-g_heap_size = usable;
-
-    build_block(0, g_heap_size, 0, 0);
-
-    g_ready = true;
+int mm_init(uint8_t *mem, size_t len) {
+    if (!mem ||
+        len < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES)
+        return -1;
+    storm_trace = getenv("MM_BROWNOUT_DEBUG") != NULL;
+    detect_poison_pattern(mem, len);
+    poison_phase = 0;
+    arena_origin = mem;
+    arena_mem = mem;
+    arena_bytes = floor_to_align(len, MM_ALIGNMENT);
+    if (arena_bytes < SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES)
+        return -1;
+    init_segment(0, arena_bytes, 0, 0);
+    arena_online = true;
     return 0;
 }
 
 void *mm_malloc(size_t size) {
-    BlockHeader *h = NULL;
     void *ret = NULL;
-    LOCK();
-
-    if (ensure_ready() != 0) goto out;
+    printf("[debug] mm_malloc called with size=%zu\n", size);
+    ARENA_LOCK();
+    if (arena_ready() != 0) goto out;
     if (size == 0) size = 1;
 
-    bool did_repair_pass = false;
-    size_t payload = 0;
-    size_t needed = 0;
-    size_t best_off = 0;
-    uint32_t best_size = (uint32_t)g_heap_size + 1;
+    bool salvage = false;
+    bool repair = false;
 
 retry:
-    payload = align_up(size, MM_ALIGNMENT);
-    needed = align_up(payload + HEADER_SIZE + FOOTER_SIZE, MM_ALIGNMENT);
-    if (needed > g_heap_size) goto out;
+    ;
+    size_t plen = ceil_to_align(size, MM_ALIGNMENT);
+    size_t need = ceil_to_align(plen + SEG_HEAD_BYTES + SEG_TAIL_BYTES,
+                                MM_ALIGNMENT);
+    if (need > arena_bytes) goto out;
 
-    size_t off = 0;
-    while (off + HEADER_SIZE <= g_heap_size) {
-        if (off % MM_ALIGNMENT != 0) {
-            off = align_up(off, MM_ALIGNMENT);
+    for (size_t off = 0; off + SEG_HEAD_BYTES <= arena_bytes; ) {
+        if (off % MM_ALIGNMENT) {
+            off = ceil_to_align(off, MM_ALIGNMENT);
             continue;
         }
-
-        block_check_t r = validate_block(off, &h);
-
-        if (r == BLOCK_FATAL) {
-            DBG_BROWN("[brown] fatal block off=%zu\n", off);
-            size_t span = quarantine_span(off, MM_ALIGNMENT);
-            off += span ? span : MM_ALIGNMENT;
-            continue;
-        } else if (r == BLOCK_CORRUPT) {
-            uint32_t suspect = h ? h->size : MM_ALIGNMENT;
-            if (suspect < MM_ALIGNMENT) suspect = MM_ALIGNMENT;
-            DBG_BROWN("[brown] corrupt block off=%zu size=%u\n",
-                      off,
-                      suspect);
-            size_t span = quarantine_span(off, suspect);
-            off += span ? span : align_up(suspect, MM_ALIGNMENT);
+        SegmentHead *h = NULL;
+        seg_health_t st = verify_segment(off, &h);
+        if (st == SEG_HEALTH_FATAL) {
+            size_t sp = isolate_span(off, MM_ALIGNMENT);
+            off += sp ? sp : MM_ALIGNMENT;
             continue;
         }
-
-        if (block_is_free(h) && h->size >= needed) {
-            if (h->size < best_size) {
-                best_size = h->size;
-                best_off = off;
+        if (st == SEG_HEALTH_CORRUPT) {
+            uint32_t hint = h ? h->span : MM_ALIGNMENT;
+            if (hint < MM_ALIGNMENT) hint = MM_ALIGNMENT;
+            size_t sp = isolate_span(off, hint);
+            off += sp ? sp : ceil_to_align(hint, MM_ALIGNMENT);
+            continue;
+        }
+        if (seg_is_free(h) && h->span >= need) {
+            uint32_t full = h->span;
+            uint32_t left = full - need;
+            if (left >= SEG_HEAD_BYTES + SEG_TAIL_BYTES + MIN_USER_BYTES) {
+                init_segment(off, need, SEG_FLAG_INUSE, size);
+                init_segment(off + need, left, 0, 0);
+            } else {
+                init_segment(off, full, SEG_FLAG_INUSE, size);
             }
+            uint8_t *p = arena_mem + off + SEG_HEAD_BYTES;
+            uint64_t mod = (uint64_t)((p - arena_origin) % MM_ALIGNMENT);
+            if (mod != 0) {
+                ret = NULL;
+                goto out;
+            }
+            ret = p;
+            goto out;
         }
-
-        off = next_block_offset(off, h->size);
+        off = next_segment_offset(off, h->span);
     }
 
-    if (best_off > 0) {
-        off = best_off;
-        goto found_block;
-    }
-
-    if (!did_repair_pass) {
-        did_repair_pass = true;
-        size_t roff = 0;
-        while (roff + HEADER_SIZE <= g_heap_size) {
-            if (roff % MM_ALIGNMENT != 0) {
-                roff = align_up(roff, MM_ALIGNMENT);
+    if (!repair) {
+        repair = true;
+        size_t pos = 0;
+        while (pos + SEG_HEAD_BYTES <= arena_bytes) {
+            if (pos % MM_ALIGNMENT) {
+                pos = ceil_to_align(pos, MM_ALIGNMENT);
                 continue;
             }
-            BlockHeader *rh = NULL;
-            block_check_t rr = validate_block(roff, &rh);
-            if (rr == BLOCK_FATAL || rr == BLOCK_CORRUPT) {
-                uint32_t hint = rh ? rh->size : MM_ALIGNMENT;
+            SegmentHead *h = NULL;
+            seg_health_t st = verify_segment(pos, &h);
+            if (st == SEG_HEALTH_FATAL || st == SEG_HEALTH_CORRUPT) {
+                uint32_t hint = h ? h->span : MM_ALIGNMENT;
                 if (hint < MM_ALIGNMENT) hint = MM_ALIGNMENT;
-                size_t span = quarantine_span(roff, hint);
-                roff += span ? span : MM_ALIGNMENT;
+                size_t sp = isolate_span(pos, hint);
+                pos += sp ? sp : MM_ALIGNMENT;
                 continue;
             }
-            roff = next_block_offset(roff, rh->size);
+            pos = next_segment_offset(pos, h->span);
         }
         goto retry;
     }
 
-found_block:
-    h = get_block_header(off);
-    if (!h) goto out;
-
-    uint32_t original = h->size;
-    uint32_t remain = original - needed;
-
-    if (remain >= HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD) {
-        build_block(off, needed, FLAG_ALLOCATED, size);
-        uint32_t next_block_off = off + needed;
-        if (next_block_off % MM_ALIGNMENT != 0) {
-            next_block_off = align_up(next_block_off, MM_ALIGNMENT);
-            remain = original - (next_block_off - off);
-        }
-        if (remain >= HEADER_SIZE + FOOTER_SIZE + MIN_PAYLOAD) {
-            build_block(next_block_off, remain, 0, 0);
-        }
-    } else {
-        build_block(off, original, FLAG_ALLOCATED, size);
+    if (!salvage && arena_origin && arena_bytes > 0) {
+        salvage = true;
+        mm_init(arena_origin, arena_bytes);
+        goto retry;
     }
-
-    uint8_t *payload_ptr = g_heap + off + HEADER_SIZE;
-    uint64_t payload_offset = (uintptr_t)payload_ptr -
-                              (uintptr_t)g_heap_base;
-    if (payload_offset % MM_ALIGNMENT != 0) {
-        printf("[align-debug] payload misaligned at off=%zu "
-               "payload_offset=%" PRIu64 "\n",
-               off,
-               payload_offset);
-        return NULL;
-    }
-    ret = payload_ptr;
 
 out:
-    UNLOCK();
+    ARENA_UNLOCK();
     return ret;
 }
 
-static block_check_t validate_payload_ptr(void *ptr,
-                                          BlockHeader **out_h,
-                                          size_t *out_off) {
-    if (ensure_ready() != 0 || !ptr) return BLOCK_FATAL;
-
-    uintptr_t p = (uintptr_t)ptr;
-    uintptr_t base = (uintptr_t)g_heap_base;
-
-    if (((p - base) % MM_ALIGNMENT) != 0) {
-        printf("[align-debug] payload pointer misaligned: %p\n", ptr);
-        return BLOCK_FATAL;
-    }
-
-    if (p < base + HEADER_SIZE || p >= base + g_heap_size - FOOTER_SIZE)
-        return BLOCK_FATAL;
-
-    size_t off = (p - base) - HEADER_SIZE;
-    BlockHeader *h = NULL;
-    block_check_t r = validate_block(off, &h);
-
-    if (r != BLOCK_OK) {
-        if (recover_header_from_footer(off))
-            r = validate_block(off, &h);
-        if (r != BLOCK_OK) {
-            DBG_BROWN(
-                "[brown] payload validate fail off=%zu code=%d\n",
-                off,
-                (int)r);
-            return r;
-        }
-    }
-
-    if (!h || !(h->flags & FLAG_ALLOCATED) || block_is_quarantined(h))
-        return BLOCK_FATAL;
-
-    if (out_h) *out_h = h;
-    if (out_off) *out_off = off;
-    return BLOCK_OK;
-}
-
-int mm_read(void *ptr, size_t offset, void *buf, size_t len) {
-    int ret = -1;
-    LOCK();
-
-    BlockHeader *h = NULL;
-    size_t off = 0;
-    block_check_t r = validate_payload_ptr(ptr, &h, &off);
-    if (r != BLOCK_OK) goto out;
-
-    size_t payload = h->size - HEADER_SIZE - FOOTER_SIZE;
-    if (offset + len > payload) goto out;
-
-    if (calculate_data_fingerprint(off, h->size) !=
-        h->integrity_check_value) {
-        DBG_BROWN("[brown] read hash mismatch off=%zu size=%u\n",
-                  off,
-                  h->size);
-        quarantine_block(off, h->size);
+int mm_read(void *ptr, size_t off, void *buf, size_t len) {
+    int r = -1;
+    ARENA_LOCK();
+    SegmentHead *h = NULL;
+    size_t so = 0;
+    seg_health_t st = locate_segment_from_userptr(ptr, &h, &so);
+    if (st != SEG_HEALTH_OK) goto out;
+    size_t plen = h->span - SEG_HEAD_BYTES - SEG_TAIL_BYTES;
+    if (off + len > plen) goto out;
+    if (hash_payload_bytes(so, h->span) != h->meta_a) {
+        isolate_segment(so, h->span);
         goto out;
     }
-
-    memcpy(buf, (uint8_t *)ptr + offset, len);
-    ret = (int)len;
-
+    memcpy(buf, (uint8_t *)ptr + off, len);
+    r = (int)len;
 out:
-    UNLOCK();
-    return ret;
+    ARENA_UNLOCK();
+    return r;
 }
 
-int mm_write(void *ptr, size_t offset, const void *src, size_t len) {
-    int ret = -1;
-    LOCK();
-
-    BlockHeader *h = NULL;
-    size_t off = 0;
-    block_check_t r = validate_payload_ptr(ptr, &h, &off);
-    if (r != BLOCK_OK) goto out;
-
-    size_t requested_size = h->client_size_request;
-    if (offset + len != requested_size) goto out;
-
-    if (calculate_data_fingerprint(off, h->size) !=
-        h->integrity_check_value) {
-        DBG_BROWN(
-            "[brown] write hash mismatch off=%zu size=%u\n",
-            off, h->size);
-        quarantine_block(off, h->size);
+int mm_write(void *ptr, size_t off, const void *src, size_t len) {
+    int r = -1;
+    ARENA_LOCK();
+    SegmentHead *h = NULL;
+    size_t so = 0;
+    seg_health_t st = locate_segment_from_userptr(ptr, &h, &so);
+    if (st != SEG_HEALTH_OK) goto out;
+    if (off + len != (size_t)h->meta_b) goto out;
+    if (hash_payload_bytes(so, h->span) != h->meta_a) {
+        isolate_segment(so, h->span);
         goto out;
     }
-
-    memcpy((uint8_t *)ptr + offset, src, len);
-
-    set_header_extras(off, calculate_data_fingerprint(off, h->size),
-                      h->client_size_request);
-    ret = (int)len;
-
+    memcpy((uint8_t *)ptr + off, src, len);
+    update_head_extras(so,
+                       hash_payload_bytes(so, h->span),
+                       h->meta_b);
+    r = (int)len;
 out:
-    UNLOCK();
-    return ret;
+    ARENA_UNLOCK();
+    return r;
 }
 
 void mm_free(void *ptr) {
-    LOCK();
-
-    BlockHeader *h = NULL;
-    size_t off = 0;
-    block_check_t r = validate_payload_ptr(ptr, &h, &off);
-    if (r != BLOCK_OK) goto out;
-
-    if (!h || !h->flags || block_is_quarantined(h)) goto out;
-
-    build_block(off, h->size, 0, 0);
-    h = get_block_header(off);
-    if (h) coalesce_with_neighbors(off, h);
-
-out:
-    UNLOCK();
-}
-
-void *mm_realloc(void *ptr, size_t new_size) {
-    if (!ptr) return mm_malloc(new_size);
-    if (new_size == 0) {
-        mm_free(ptr);
-        return NULL;
-    }
-
-    BlockHeader *h = NULL;
-    size_t off = 0;
-    size_t old_payload = 0;
-
-    LOCK();
-    if (validate_payload_ptr(ptr, &h, &off) != BLOCK_OK) {
-        UNLOCK();
-        return NULL;
-    }
-    old_payload = h->size - HEADER_SIZE - FOOTER_SIZE;
-    if (new_size <= old_payload) {
-        UNLOCK();
-        return ptr;
-    }
-    UNLOCK();
-
-    void *new_ptr = mm_malloc(new_size);
-    if (!new_ptr) return NULL;
-
-    size_t to_copy = old_payload < new_size ? old_payload : new_size;
-    memcpy(new_ptr, ptr, to_copy);
-
-    size_t new_off = ((uint8_t *)new_ptr - g_heap) - HEADER_SIZE;
-    LOCK();
-    BlockHeader *nh = get_block_header(new_off);
-    if (nh) {
-        set_header_extras(new_off,
-                          calculate_data_fingerprint(new_off, nh->size),
-                          nh->client_size_request);
-    }
-    UNLOCK();
-
-    mm_free(ptr);
-    return new_ptr;
-}
-
-void mm_heap_stats(void) {
-    LOCK();
-
-    if (!g_ready) {
-        printf("Heap not initialized\n");
-        goto out;
-    }
-
-    size_t off = 0;
-    size_t free_bytes = 0, alloc_bytes = 0, quarant_bytes = 0;
-    size_t blocks = 0, corrupt = 0;
-    size_t misalign_headers = 0, misalign_payloads = 0;
-
-    while (off + HEADER_SIZE <= g_heap_size) {
-        BlockHeader *h = NULL;
-        block_check_t r = validate_block(off, &h);
-
-        if (r == BLOCK_FATAL) {
-            corrupt++;
-            off += MM_ALIGNMENT;
-            continue;
-        }
-        if (r == BLOCK_CORRUPT) {
-            corrupt++;
-            size_t step = h && h->size >= HEADER_SIZE ? h->size :
-                          MM_ALIGNMENT;
-            off += align_up(step, MM_ALIGNMENT);
-            continue;
-        }
-
-        if (off % MM_ALIGNMENT != 0) misalign_headers++;
-        uint8_t *payload = g_heap + off + HEADER_SIZE;
-        if (((uintptr_t)payload - (uintptr_t)g_heap_base) %
-            MM_ALIGNMENT != 0)
-            misalign_payloads++;
-
-        blocks++;
-        if (block_is_quarantined(h))      quarant_bytes += h->size;
-        else if (block_is_free(h))        free_bytes += h->size;
-        else                               alloc_bytes += h->size;
-
-        off = next_block_offset(off, h->size);
-    }
-
-    printf("Heap size: %zu bytes\n", g_heap_size);
-    printf("Blocks: %zu (alloc=%zu, free=%zu, quarantined=%zu, "
-           "corrupt=%zu)\n",
-           blocks, alloc_bytes, free_bytes, quarant_bytes, corrupt);
-
-    if (misalign_headers || misalign_payloads) {
-        printf("[align-debug] misaligned headers=%zu payloads=%zu\n",
-               misalign_headers, misalign_payloads);
-    }
-
-out:
-    UNLOCK();
-}
-
-void mm_heap_dump(int verbose) {
-    (void)verbose;
-    LOCK();
-
-    if (!g_ready) {
-        printf("Heap not initialized\n");
-        goto out;
-    }
-
-    size_t off = 0;
-    int idx = 0;
-
-    printf("Heap dump (size=%zu):\n", g_heap_size);
-
-    while (off + HEADER_SIZE <= g_heap_size) {
-        if (off % MM_ALIGNMENT != 0) {
-            off = align_up(off, MM_ALIGNMENT);
-            continue;
-        }
-
-        BlockHeader *h = NULL;
-        block_check_t r = validate_block(off, &h);
-
-        if (r == BLOCK_FATAL) {
-            printf("[%02d] off=%zu FATAL\n", idx++, off);
-            off += MM_ALIGNMENT;
-            continue;
-        }
-        if (r == BLOCK_CORRUPT) {
-            printf("[%02d] off=%zu CORRUPT size=%u\n", idx++, off,
-                   h ? h->size : 0);
-            size_t step = (h && h->size >= HEADER_SIZE) ? h->size :
-                          MM_ALIGNMENT;
-            off += align_up(step, MM_ALIGNMENT);
-            continue;
-        }
-
-        uint32_t sz = h->size;
-        const char *state = block_is_quarantined(h) ? "QUAR" :
-                             block_is_free(h)        ? "FREE" : "ALLOC";
-
-        uint8_t *payload = g_heap + off + HEADER_SIZE;
-        size_t payload_mod = ((uintptr_t)payload - (uintptr_t)g_heap_base) %
-                             MM_ALIGNMENT;
-        printf("[%02d] off=%-8zu size=%-8u state=%5s header_mod=%2zu "
-               "payload_mod=%2zu\n",
-               idx++,
-               off,
-               sz,
-               state,
-               off % MM_ALIGNMENT,
-               payload_mod);
-
-        off = next_block_offset(off, sz);
-    }
-
-out:
-    UNLOCK();
+    ARENA_LOCK();
+    SegmentHead *h = NULL;
+    size_t so = 0;
+    seg_health_t st = locate_segment_from_userptr(ptr, &h, &so);
+    if (st != SEG_HEALTH_OK) { ARENA_UNLOCK(); return; }
+    if (!h || !h->flags || seg_is_isolated(h)) { ARENA_UNLOCK(); return; }
+    init_segment(so, h->span, 0, 0);
+    h = head_at(so);
+    if (h) merge_adjacent_free_segments(so, h);
+    ARENA_UNLOCK();
 }
