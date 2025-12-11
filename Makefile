@@ -22,4 +22,4 @@ clean:
 	rm -f *.o liballocator.so runme
 
 test: runme
-	./runme --size 125600 --storm 999 --seed 5
+	./runme --size 125600 --storm 999 --seed 5
