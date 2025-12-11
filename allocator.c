@@ -249,12 +249,14 @@ static size_t quarantine_span(size_t off, uint32_t hint_size) {
 }
 
 static bool recover_header_from_footer(size_t off) {
+    // Scan for a plausible footer on MM_ALIGNMENT boundaries.
     size_t start = off + HEADER_SIZE + MIN_PAYLOAD;
     if (start + FOOTER_SIZE > g_heap_size) return false;
 
     DBG_BROWN("[brown] recover start off=%zu start=%zu\n", off, start);
 
-    for (size_t foff = start; foff + FOOTER_SIZE <= g_heap_size; foff += 1) {
+    for (size_t foff = start; foff + FOOTER_SIZE <= g_heap_size;
+         foff += MM_ALIGNMENT) {
         BlockFooter *f = (BlockFooter *)(g_heap + foff);
 
         uint32_t size = f->size;
